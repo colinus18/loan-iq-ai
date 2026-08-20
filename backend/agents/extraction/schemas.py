@@ -30,7 +30,8 @@ class DocumentType(str, Enum):
 class ExtractionStatus(str, Enum):
     PENDING    = "pending"
     PROCESSING = "processing"
-    SUCCESS    = "success"
+    COMPLETED  = "completed"
+    SUCCESS    = "completed"
     PARTIAL    = "partial"
     FAILED     = "failed"
 

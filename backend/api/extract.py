@@ -26,7 +26,7 @@ from backend.agents.extraction import store as extraction_store
 from backend.agents.extraction.schemas import ErrorResponse
 
 logger     = logging.getLogger("api.extract")
-router     = APIRouter(prefix="/extract", tags=["Extraction — Member 3"])
+router     = APIRouter(tags=["Extraction — Member 3"])
 extractor  = GeminiExtractor()   # Singleton — Gemini model is lazy-loaded
 
 
@@ -35,7 +35,7 @@ extractor  = GeminiExtractor()   # Singleton — Gemini model is lazy-loaded
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post(
-    "",
+    "/extract",
     response_model=ExtractResponse,
     status_code=status.HTTP_200_OK,
     summary="Extract structured fields from OCR text using Gemini AI",
@@ -92,8 +92,8 @@ async def extract_fields(payload: ExtractRequest) -> ExtractResponse:
 
     # Determine overall status
     statuses = {r.status for r in doc_results}
-    if all(s == ExtractionStatus.SUCCESS for s in statuses):
-        overall = ExtractionStatus.SUCCESS
+    if all(s in (ExtractionStatus.COMPLETED, ExtractionStatus.SUCCESS) for s in statuses):
+        overall = ExtractionStatus.COMPLETED
     elif all(s == ExtractionStatus.FAILED for s in statuses):
         overall = ExtractionStatus.FAILED
     else:
