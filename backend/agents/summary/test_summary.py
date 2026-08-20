@@ -12,7 +12,6 @@ risk_result = {
     ]
 }
 
-
 summary = generate_summary(risk_result)
 
 print(summary)
