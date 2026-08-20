@@ -56,16 +56,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Routers ───────────────────────────────────────────────────────────────────
+# Member 4 router (validation)
+from backend.api.validate import router as validate_router
+
+# Routers
 app.include_router(extract_router)
+app.include_router(validate_router)
 
 # Other members' routers will be included here as they build them:
 # from backend.api.upload   import router as upload_router
-# from backend.api.validate import router as validate_router
 # from backend.api.risk     import router as risk_router
 # from backend.api.summary  import router as summary_router
 # app.include_router(upload_router)
-# app.include_router(validate_router)
 # app.include_router(risk_router)
 # app.include_router(summary_router)
 

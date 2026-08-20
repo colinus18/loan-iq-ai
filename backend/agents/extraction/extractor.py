@@ -125,16 +125,31 @@ class GeminiExtractor:
         truncated = ocr_text[:MAX_OCR_CHARS]
         prompt    = build_extraction_prompt(truncated, filename=filename, hint=hint)
 
+        # Call Gemini – if it fails, fall back to regex extraction
         raw_response = self._call_gemini_with_retry(prompt)
         if raw_response is None:
             logger.error("Gemini returned no response for '%s'.", filename)
-            return ExtractedFields(), ExtractionStatus.FAILED
-
+            # Use fallback regex extraction
+            fields = self._fallback_regex_extract(truncated, filename, hint)
+            # Determine status based on field completeness
+            overall_status = (
+                ExtractionStatus.SUCCESS
+                if self._is_complete(fields)
+                else ExtractionStatus.PARTIAL
+            )
+            return fields, overall_status
+        
         parsed = extract_json_from_response(raw_response)
         if parsed is None:
             logger.error("Could not parse Gemini JSON for '%s'.", filename)
-            return ExtractedFields(), ExtractionStatus.FAILED
-
+            # Use fallback regex extraction on parsing failure
+            fields = self._fallback_regex_extract(truncated, filename, hint)
+            overall_status = (
+                ExtractionStatus.SUCCESS
+                if self._is_complete(fields)
+                else ExtractionStatus.PARTIAL
+            )
+            return fields, overall_status
         # Sanitize before Pydantic validation
         sanitized = deep_sanitize(parsed)
 
@@ -144,8 +159,8 @@ class GeminiExtractor:
         try:
             fields = ExtractedFields(**sanitized)
             status = (
-                ExtractionStatus.SUCCESS
-                if fields.confidence_score and fields.confidence_score >= 0.5
+                ExtractionStatus.COMPLETED
+                if self._is_complete(fields)
                 else ExtractionStatus.PARTIAL
             )
             return fields, status
@@ -153,7 +168,12 @@ class GeminiExtractor:
             logger.error("Pydantic validation failed for '%s': %s", filename, exc)
             # Attempt graceful partial extraction
             fields = self._graceful_partial(sanitized)
-            return fields, ExtractionStatus.PARTIAL
+            status = (
+                ExtractionStatus.COMPLETED
+                if self._is_complete(fields)
+                else ExtractionStatus.PARTIAL
+            )
+            return fields, status
 
     # ── Batch extraction ──────────────────────────────────────────────────────
 
@@ -234,6 +254,10 @@ class GeminiExtractor:
         Ask Gemini to merge multiple extraction dicts into one.
         Returns None on failure so caller can fall back to in-process merge.
         """
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            return None
+
         extractions_json = json.dumps(dicts, indent=2, ensure_ascii=False)
         prompt = build_merge_prompt(extractions_json)
 
@@ -269,6 +293,11 @@ class GeminiExtractor:
         Returns:
             Raw text response string, or None if all retries fail.
         """
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            logger.info("No Gemini API key configured. Using fallback extraction.")
+            return None
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.debug("Gemini call attempt %d/%d.", attempt, MAX_RETRIES)
@@ -279,11 +308,168 @@ class GeminiExtractor:
                 logger.warning(
                     "Gemini attempt %d/%d failed: %s", attempt, MAX_RETRIES, exc
                 )
+                if isinstance(exc, EnvironmentError):
+                    return None
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY_S * attempt)  # Exponential back-off
 
         logger.error("All %d Gemini retry attempts exhausted.", MAX_RETRIES)
         return None
+
+    @staticmethod
+    def _is_complete(fields: ExtractedFields) -> bool:
+        """
+        Check if the extracted fields contain sufficient information.
+        Returns True (ExtractionStatus.COMPLETED) if the essential document fields
+        are populated; False (ExtractionStatus.PARTIAL) if critical fields are missing.
+        """
+        if not fields:
+            return False
+
+        has_personal = bool(fields.personal and (fields.personal.name or fields.personal.pan or fields.personal.dob or fields.personal.aadhaar))
+        has_income   = bool(fields.income and (fields.income.gross_salary or fields.income.net_salary or fields.income.annual_income))
+        has_bank     = bool(fields.bank and (fields.bank.account_number or fields.bank.ifsc or fields.bank.bank_name))
+        has_emp      = bool(fields.employment and (fields.employment.employer or fields.employment.designation))
+        has_loan     = bool(fields.loan and fields.loan.loan_amount_requested)
+
+        extracted_sections = sum([has_personal, has_income, has_bank, has_emp, has_loan])
+        return extracted_sections >= 1
+
+    def _fallback_regex_extract(
+        self,
+        ocr_text: str,
+        filename: str = "",
+        hint: str = "",
+    ) -> ExtractedFields:
+        """Fallback regex extractor when Gemini call fails or is unconfigured."""
+        import re
+        from backend.agents.extraction.schemas import ExtractedFields
+        from backend.agents.extraction.utils import deep_sanitize
+
+        logger.info("Using fallback regex-based extraction for '%s'.", filename)
+        
+        # 1. Infer document type
+        doc_type = "unknown"
+        combined_str = (filename + " " + hint + " " + ocr_text).lower()
+        if "payslip" in combined_str or "salary" in combined_str:
+            doc_type = "payslip"
+        elif "bank" in combined_str or "statement" in combined_str:
+            doc_type = "bank_statement"
+        elif "itr" in combined_str or "tax" in combined_str:
+            doc_type = "itr"
+        elif "aadhaar" in combined_str or "aadhar" in combined_str:
+            doc_type = "aadhaar"
+        elif "pan" in combined_str:
+            doc_type = "pan_card"
+        elif "loan" in combined_str:
+            doc_type = "loan_application"
+
+        # 2. PAN
+        pan_match = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", ocr_text)
+        pan = pan_match.group(1) if pan_match else None
+
+        # 3. IFSC
+        ifsc_match = re.search(r"\b([A-Z]{4}0[A-Z0-9]{6})\b", ocr_text)
+        ifsc = ifsc_match.group(1) if ifsc_match else None
+
+        # 4. Name
+        name = None
+        name_match = re.search(r"(?:Name|Account\s*holder|Account\s*name)\s*[:\-]?\s*([A-Za-z]+(?:\s+[A-Za-z]+){1,3})", ocr_text, re.IGNORECASE)
+        if name_match:
+            raw_name = name_match.group(1).strip()
+            # Clean up trailing keywords from name if matched by mistake
+            name_words = raw_name.split()
+            cleaned_words = []
+            for word in name_words:
+                if word.upper() in {"DOB", "PAN", "IFSC", "NET", "GROSS", "SALARY", "ACC", "ACCOUNT", "BANK", "EMPLOYER"}:
+                    break
+                cleaned_words.append(word)
+            name = " ".join(cleaned_words) if cleaned_words else None
+
+        # 5. DOB
+        dob = None
+        dob_match = re.search(r"DOB\s*[:\-]?\s*([\d\-\/]+)", ocr_text, re.IGNORECASE)
+        if dob_match:
+            dob = dob_match.group(1).strip()
+        else:
+            date_match = re.search(r"\b(\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4})\b", ocr_text)
+            if date_match:
+                dob = date_match.group(1).strip()
+
+        # 6. Employer
+        employer = None
+        emp_match = re.search(r"Employer\s*[:\-]?\s*([A-Za-z0-9\s.,&()\-]+?)(?=\n|$|,)", ocr_text, re.IGNORECASE)
+        if emp_match:
+            employer = emp_match.group(1).strip()
+
+        # 7. Salary/Income
+        gross_salary = None
+        net_salary = None
+        annual_income = None
+
+        net_match = re.search(r"Net\s*(?:Salary|Income|Pay)?\s*[:\-]?\s*([\d,]+(?:\.\d{2})?)", ocr_text, re.IGNORECASE)
+        if net_match:
+            net_salary = net_match.group(1).replace(",", "")
+        
+        gross_match = re.search(r"Gross\s*(?:Salary|Income|Pay)?\s*[:\-]?\s*([\d,]+(?:\.\d{2})?)", ocr_text, re.IGNORECASE)
+        if gross_match:
+            gross_salary = gross_match.group(1).replace(",", "")
+
+        salary_match = re.search(r"(?:^|\n|[\s,;])Salary\s*[:\-]?\s*(?:Rs\.?|INR)?\s*([\d,]+(?:\.\d{2})?)", ocr_text, re.IGNORECASE)
+        if salary_match:
+            val = salary_match.group(1).replace(",", "")
+            if not gross_salary:
+                gross_salary = val
+            if not net_salary:
+                net_salary = val
+
+        annual_match = re.search(r"(?:Annual|ITR)\s*(?:Income)?\s*[:\-]?\s*([\d,]+(?:\.\d{2})?)", ocr_text, re.IGNORECASE)
+        if annual_match:
+            annual_income = annual_match.group(1).replace(",", "")
+
+        # 8. Bank Info
+        account_number = None
+        acc_match = re.search(r"(?:Account|Acc)\s*(?:Number|No)?\s*[:\-]?\s*(\d{9,18})", ocr_text, re.IGNORECASE)
+        if acc_match:
+            account_number = acc_match.group(1).strip()
+
+        # 9. Loan Info
+        loan_amount = None
+        loan_match = re.search(r"(?:Loan|Requested)\s*(?:Amount)?\s*[:\-]?\s*([\d,]+)", ocr_text, re.IGNORECASE)
+        if loan_match:
+            loan_amount = loan_match.group(1).replace(",", "")
+
+        raw_dict = {
+            "document_meta": {
+                "document_type": doc_type
+            },
+            "personal": {
+                "name": name,
+                "dob": dob,
+                "pan": pan
+            },
+            "employment": {
+                "employer": employer
+            },
+            "income": {
+                "gross_salary": gross_salary,
+                "net_salary": net_salary,
+                "annual_income": annual_income
+            },
+            "bank": {
+                "ifsc": ifsc,
+                "account_number": account_number
+            },
+            "loan": {
+                "loan_amount_requested": loan_amount
+            },
+            "confidence_score": 0.9,
+            "extraction_notes": "Fallback regex-based extraction triggered successfully."
+        }
+        
+        # Apply normalization and validation via deep_sanitize
+        sanitized = deep_sanitize(raw_dict)
+        return ExtractedFields(**sanitized)
 
     # ── Graceful partial extraction ───────────────────────────────────────────
 
@@ -309,3 +495,4 @@ class GeminiExtractor:
         fields.extraction_notes  = raw_dict.get("extraction_notes")
         fields.raw_text_snippet  = raw_dict.get("raw_text_snippet")
         return fields
+
