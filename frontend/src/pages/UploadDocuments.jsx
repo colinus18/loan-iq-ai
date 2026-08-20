@@ -1,5 +1,6 @@
 import { useState } from "react"
 import { useNavigate } from "react-router-dom"
+import { uploadDocument } from "../api/upload";
 
 function Upload() {
   const [selectedFile, setSelectedFile] = useState(null)
@@ -33,25 +34,44 @@ function Upload() {
     setMessage("")
   }
 
-  const handleUpload = () => {
-    if (!selectedFile) {
-      setMessage("Please select a file first.")
-      return
-    }
+const handleUpload = async () => {
+  if (!selectedFile) {
+    setMessage("Please select a file first.");
+    return;
+  }
 
-    const documentData = {
-      name: selectedFile.name,
-      size: selectedFile.size,
-      type: selectedFile.type,
-    }
+  try {
+    setMessage("Uploading document...");
+
+    const uploadResponse = await uploadDocument(selectedFile);
+
+    console.log("Upload Response:", uploadResponse);
+
+    localStorage.setItem(
+      "application_id",
+      uploadResponse.application_id
+    );
+
+    localStorage.setItem(
+      "file_path",
+      uploadResponse.file_path
+    );
 
     localStorage.setItem(
       "uploadedDocument",
-      JSON.stringify(documentData)
-    )
+      JSON.stringify({
+        name: selectedFile.name,
+        size: selectedFile.size,
+        type: selectedFile.type,
+      })
+    );
 
-    navigate("/processing")
+    navigate("/processing");
+  } catch (error) {
+    console.error(error);
+    setMessage("Upload failed.");
   }
+};
 
   return (
     <div className="relative min-h-screen overflow-hidden text-white">
